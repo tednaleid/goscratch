@@ -1,0 +1,7 @@
+.DS_Store
+out
+.idea
+dist/
+# ignore binaries under command, but commit .go files
+cmd/*/*
+!cmd/*/*.go
