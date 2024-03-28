@@ -6,7 +6,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/RoaringBitmap/roaring v1.9.3
 	github.com/stretchr/testify v1.8.4
-	github.com/urfave/cli/v3 v3.0.0-alpha7
+	github.com/urfave/cli/v3 v3.0.0-alpha9
 )
 
 require (
