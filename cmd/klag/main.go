@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -138,15 +138,17 @@ func (m *kafkaLagMonitor) consumeOffsets(ctx context.Context) {
 func (m *kafkaLagMonitor) processMessage(msg *sarama.ConsumerMessage) {
 	key, err := parseKey(msg.Key)
 	if err != nil {
-		log.Fatalf("Error parsing key: %v", err)
+		// invalid key, ignore
+		return
 	}
 
-	fmt.Println(key)
-
 	if key.Group == m.groupID && (m.topic == "" || m.topic == key.Topic) && (m.partition == -1 || int32(m.partition) == key.Partition) {
+		fmt.Println(key)
+
 		value, err := parseValue(msg.Value)
 		if err != nil {
-			log.Fatalf("Error parsing value: %v", err)
+			log.Printf("Error parsing value: %v\n", err)
+			return
 		}
 
 		fmt.Println(value)
@@ -188,78 +190,169 @@ func (k KeyInfo) String() string {
 }
 
 func parseKey(key []byte) (KeyInfo, error) {
-	var info KeyInfo
+	if len(key) < 2 {
+		return KeyInfo{}, errors.New("key is too short")
+	}
 
-	version, err := binary.ReadVarint(bytes.NewBuffer(key))
+	version := int16(binary.BigEndian.Uint16(key[:2]))
+	key = key[2:]
+
+	switch version {
+	case 0, 1:
+		return parseKeyV0V1(key, int64(version))
+	case 2:
+		return parseKeyV2(key)
+	default:
+		return KeyInfo{}, fmt.Errorf("unsupported version: %d", version)
+	}
+}
+
+func parseKeyV0V1(key []byte, version int64) (KeyInfo, error) {
+	group, key, err := decodeString(key)
 	if err != nil {
-		return info, fmt.Errorf("error reading version: %v", err)
-	}
-	info.Version = version
-
-	if version == 0 || version == 1 {
-		group, err := decodeCompactString(key[2:])
-		if err != nil {
-			return info, fmt.Errorf("error decoding group: %v", err)
-		}
-		info.Group = group
-
-		topic, err := decodeCompactString(key[2+len(group):])
-		if err != nil {
-			return info, fmt.Errorf("error decoding topic: %v", err)
-		}
-		info.Topic = topic
-
-		partition := binary.BigEndian.Uint32(key[2+len(group)+len(topic):])
-		info.Partition = int32(partition)
+		return KeyInfo{}, err
 	}
 
-	return info, nil
+	topic, key, err := decodeString(key)
+	if err != nil {
+		return KeyInfo{}, err
+	}
+
+	if len(key) < 4 {
+		return KeyInfo{}, errors.New("key is too short for partition")
+	}
+	partition := int32(binary.BigEndian.Uint32(key))
+
+	return KeyInfo{
+		Version:   version,
+		Group:     group,
+		Topic:     topic,
+		Partition: partition,
+	}, nil
+}
+
+func parseKeyV2(key []byte) (KeyInfo, error) {
+	group, key, err := decodeString(key)
+	if err != nil {
+		return KeyInfo{}, err
+	}
+
+	topic, key, err := decodeString(key)
+	if err != nil {
+		return KeyInfo{}, err
+	}
+
+	if len(key) < 4 {
+		return KeyInfo{}, errors.New("key is too short for partition")
+	}
+	partition := int32(binary.BigEndian.Uint32(key))
+
+	return KeyInfo{
+		Version:   2,
+		Group:     group,
+		Topic:     topic,
+		Partition: partition,
+	}, nil
+}
+
+func decodeString(data []byte) (string, []byte, error) {
+	if len(data) < 2 {
+		return "", nil, errors.New("data is too short for string length")
+	}
+	length := int(binary.BigEndian.Uint16(data[:2]))
+	data = data[2:]
+
+	if len(data) < length {
+		return "", nil, fmt.Errorf("data is too short for string content: need %d, have %d", length, len(data))
+	}
+	return string(data[:length]), data[length:], nil
 }
 
 type ValueInfo struct {
 	Version   int64
 	Offset    int64
-	Metadata  string
 	Timestamp time.Time
 }
 
 func (v ValueInfo) String() string {
-	return fmt.Sprintf("Version: %d, Offset: %d, Metadata: %s, Timestamp: %s", v.Version, v.Offset, v.Metadata, v.Timestamp)
+	return fmt.Sprintf("Version: %d, Offset: %d, Timestamp: %s", v.Version, v.Offset, v.Timestamp)
 }
 
 func parseValue(value []byte) (ValueInfo, error) {
-	var info ValueInfo
-
-	version, err := binary.ReadVarint(bytes.NewBuffer(value))
-	if err != nil {
-		return info, fmt.Errorf("error reading version: %v", err)
+	if len(value) < 2 {
+		return ValueInfo{}, errors.New("value is too short")
 	}
-	info.Version = version
 
-	offset := binary.BigEndian.Uint64(value[2:])
-	info.Offset = int64(offset)
+	version := int16(binary.BigEndian.Uint16(value[:2]))
+	value = value[2:]
 
-	metadata, err := decodeCompactString(value[10:])
-	if err != nil {
-		return info, fmt.Errorf("error decoding metadata: %v", err)
+	switch version {
+	case 0, 1:
+		return parseValueV0V1(value, int64(version))
+	case 2, 3:
+		return parseValueV2V3(value, int64(version))
+	default:
+		return ValueInfo{}, fmt.Errorf("unsupported version: %d", version)
 	}
-	info.Metadata = metadata
-
-	timestampMillis := binary.BigEndian.Uint64(value[10+len(metadata):])
-	timestampSecs := int64(timestampMillis / 1000)
-	timestampNanos := int64((timestampMillis % 1000) * 1e6) // Convert remaining milliseconds to nanoseconds
-	info.Timestamp = time.Unix(timestampSecs, timestampNanos)
-
-	return info, nil
 }
 
-func decodeCompactString(data []byte) (string, error) {
-	length, bytesRead := binary.Uvarint(data)
-	if bytesRead <= 0 {
-		return "", fmt.Errorf("error decoding string length")
+func parseValueV0V1(value []byte, version int64) (ValueInfo, error) {
+	if len(value) < 8 {
+		return ValueInfo{}, errors.New("value is too short for offset")
 	}
-	str := string(data[bytesRead : bytesRead+int(length)])
-	return str, nil
+	offset := int64(binary.BigEndian.Uint64(value[:8]))
+	value = value[8:]
+
+	if len(value) < 8 {
+		return ValueInfo{}, errors.New("value is too short for timestamp")
+	}
+	timestamp := time.Unix(0, int64(binary.BigEndian.Uint64(value)))
+
+	return ValueInfo{
+		Version:   version,
+		Offset:    offset,
+		Timestamp: timestamp,
+	}, nil
+}
+
+func parseValueV2V3(value []byte, version int64) (ValueInfo, error) {
+	if len(value) < 8 {
+		return ValueInfo{}, errors.New("value is too short for offset")
+	} else {
+		// print the length of the value, and print the hex value of the value
+		fmt.Printf("value length: %d, value: %x\n", len(value), value)
+	}
+	offset := int64(binary.BigEndian.Uint64(value[:8]))
+	// also skip over the metadata, which seems to always be 2 bytes of garbage
+	//value = value[10:]
+
+	// get the last 8 bytes in value:
+	value = value[len(value)-8:]
+
+	fmt.Printf("trimmed value length: %d, value: %x\n", len(value), value)
+
+	// we don't care about metadata, but need to skip over the bytes in the metadata
+	//_, remainingValue, err := decodeString(value)
+	//if err != nil {
+	//	return ValueInfo{}, fmt.Errorf("error decoding metadata: %w", err)
+	//}
+	//value = remainingValue
+
+	if len(value) < 8 {
+		return ValueInfo{}, errors.New("value is too short for commit timestamp")
+	}
+	commitTimestamp := time.Unix(0, int64(binary.BigEndian.Uint64(value[:8]))*int64(time.Millisecond))
+	value = value[8:]
+
+	if len(value) < 8 {
+		return ValueInfo{}, errors.New("value is too short for expire timestamp")
+	}
+
+	return ValueInfo{
+		Version:   version,
+		Offset:    offset,
+		Timestamp: commitTimestamp,
+	}, nil
 }
 
 func (m *kafkaLagMonitor) displayStats(ctx context.Context) {
