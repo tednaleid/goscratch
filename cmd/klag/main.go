@@ -9,34 +9,19 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
 )
 
-type partitionInfo struct {
-	topic           string
-	partition       int32
-	currentOffset   int64
-	committedOffset int64
-	lag             int64
-	lastTimestamp   time.Time
-	firstTimestamp  time.Time
-	lastOffset      int64
-	firstOffset     int64
-	mutex           sync.Mutex
-}
-
 type kafkaLagMonitor struct {
-	client           sarama.Client
-	admin            sarama.ClusterAdmin
-	consumer         sarama.Consumer
-	partitionInfoMap map[string]*partitionInfo
-	mapMutex         sync.Mutex
-	groupID          string
-	topic            string
-	partition        int
+	client    sarama.Client
+	admin     sarama.ClusterAdmin
+	consumer  sarama.Consumer
+	groupID   string
+	topic     string
+	partition int
+	kvChannel chan KeyAndValue // Add this line
 }
 
 func main() {
@@ -51,8 +36,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go monitor.consumeOffsets(ctx)
-	go monitor.displayStats(ctx)
+	go monitor.consumeGroupIdProgress(ctx)
+	go monitor.emitGroupIdProgress()
 
 	waitForInterrupt(cancel)
 	fmt.Println("\nShutting down...")
@@ -76,7 +61,7 @@ func parseFlags() (string, string, string, int) {
 func newKafkaLagMonitor(broker, groupID, topic string, partition int) (*kafkaLagMonitor, error) {
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_0_0_0
-	fmt.Fprintf(os.Stderr, "broker: %s group: %s, topic: %s, partition: %d\n", broker, groupID, topic, partition)
+	//fmt.Fprintf(os.Stderr, "broker: %s group: %s, topic: %s, partition: %d\n", broker, groupID, topic, partition)
 
 	client, err := sarama.NewClient([]string{broker}, config)
 	if err != nil {
@@ -97,13 +82,13 @@ func newKafkaLagMonitor(broker, groupID, topic string, partition int) (*kafkaLag
 	}
 
 	return &kafkaLagMonitor{
-		client:           client,
-		admin:            admin,
-		consumer:         consumer,
-		partitionInfoMap: make(map[string]*partitionInfo),
-		groupID:          groupID,
-		topic:            topic,
-		partition:        partition,
+		client:    client,
+		admin:     admin,
+		consumer:  consumer,
+		groupID:   groupID,
+		topic:     topic,
+		partition: partition,
+		kvChannel: make(chan KeyAndValue),
 	}, nil
 }
 
@@ -111,13 +96,49 @@ func (m *kafkaLagMonitor) close() {
 	m.consumer.Close()
 	m.admin.Close()
 	m.client.Close()
+	close(m.kvChannel)
 }
 
-func (m *kafkaLagMonitor) consumeOffsets(ctx context.Context) {
-	consumerOffsetsTopic := "__consumer_offsets"
-	partitionToConsume := abs(stringHashCode(m.groupID) % 50)
+type PartitionInfo struct {
+	firstOffset, lastOffset       int64
+	firstTimestamp, lastTimestamp time.Time
+}
 
-	fmt.Fprintf(os.Stderr, "partitionToConsume: %d\n", partitionToConsume)
+func (m *kafkaLagMonitor) emitGroupIdProgress() {
+	partitionData := make(map[string]*PartitionInfo)
+
+	for kv := range m.kvChannel {
+		key := fmt.Sprintf("%s-%d", kv.Key.Topic, kv.Key.Partition)
+
+		if _, ok := partitionData[key]; !ok {
+			partitionData[key] = &PartitionInfo{
+				firstOffset:    kv.Value.Offset,
+				lastOffset:     kv.Value.Offset,
+				firstTimestamp: kv.Value.Timestamp,
+				lastTimestamp:  kv.Value.Timestamp,
+			}
+		}
+
+		partitionInfo := partitionData[key]
+
+		recordsSinceLastCommit := kv.Value.Offset - partitionInfo.lastOffset
+		elapsedSinceLastCommit := kv.Value.Timestamp.Sub(partitionInfo.lastTimestamp).Truncate(time.Second)
+
+		recordsPerSecondSinceLastCommit := float64(recordsSinceLastCommit) / elapsedSinceLastCommit.Seconds()
+
+		fmt.Printf("%s %3d %s %d +%d %s %.2f/s\n", kv.Key.Topic, kv.Key.Partition, kv.Value.Timestamp, kv.Value.Offset, recordsSinceLastCommit, elapsedSinceLastCommit, recordsPerSecondSinceLastCommit)
+
+		partitionData[key].lastOffset = kv.Value.Offset
+		partitionData[key].lastTimestamp = kv.Value.Timestamp
+	}
+}
+
+func (m *kafkaLagMonitor) consumeGroupIdProgress(ctx context.Context) {
+	consumerOffsetsTopic := "__consumer_offsets"
+	consumerOffsetsPartitionCount := 50
+	partitionToConsume := abs(stringHashCode(m.groupID) % int32(consumerOffsetsPartitionCount))
+
+	//fmt.Fprintf(os.Stderr, "partitionToConsume: %d\n", partitionToConsume)
 
 	partitionConsumer, err := m.consumer.ConsumePartition(consumerOffsetsTopic, int32(partitionToConsume), sarama.OffsetOldest)
 	if err != nil {
@@ -143,39 +164,18 @@ func (m *kafkaLagMonitor) processMessage(msg *sarama.ConsumerMessage) {
 	}
 
 	if key.Group == m.groupID && (m.topic == "" || m.topic == key.Topic) && (m.partition == -1 || int32(m.partition) == key.Partition) {
-		fmt.Println(key)
-
 		value, err := parseValue(msg.Value)
 		if err != nil {
 			log.Printf("Error parsing value: %v\n", err)
 			return
 		}
-
-		fmt.Println(value)
-
-		//m.mapMutex.Lock()
-		//key := fmt.Sprintf("%s-%d", key.Topic, key.Partition)
-		//info, ok := m.partitionInfoMap[key]
-		//if !ok {
-		//	info = &partitionInfo{
-		//		topic:     key.Topic,
-		//		partition: key.Partition,
-		//	}
-		//	m.partitionInfoMap[key] = info
-		//}
-		//m.mapMutex.Unlock()
-		//
-		//info.mutex.Lock()
-		//info.committedOffset = offset
-		//currentTime := time.Now()
-		//if info.firstTimestamp.IsZero() {
-		//	info.firstTimestamp = currentTime
-		//	info.firstOffset = offset
-		//}
-		//info.lastTimestamp = currentTime
-		//info.lastOffset = offset
-		//info.mutex.Unlock()
+		m.kvChannel <- KeyAndValue{Key: key, Value: value}
 	}
+}
+
+type KeyAndValue struct {
+	Key   KeyInfo
+	Value ValueInfo
 }
 
 type KeyInfo struct {
@@ -189,6 +189,8 @@ func (k KeyInfo) String() string {
 	return fmt.Sprintf("Version: %d, Group: %s, Topic: %s, Partition: %d", k.Version, k.Group, k.Topic, k.Partition)
 }
 
+// kafka source code for keys:
+// https://github.com/apache/kafka/blob/8152ee6519f1c2d0608702000ed9c0b1162c447d/core/src/main/scala/kafka/coordinator/group/GroupMetadataManager.scala#L1077
 func parseKey(key []byte) (KeyInfo, error) {
 	if len(key) < 2 {
 		return KeyInfo{}, errors.New("key is too short")
@@ -278,6 +280,8 @@ func (v ValueInfo) String() string {
 	return fmt.Sprintf("Version: %d, Offset: %d, Timestamp: %s", v.Version, v.Offset, v.Timestamp)
 }
 
+// source code for values:
+// https://github.com/apache/kafka/blob/8152ee6519f1c2d0608702000ed9c0b1162c447d/core/src/main/scala/kafka/coordinator/group/GroupMetadataManager.scala#L1090
 func parseValue(value []byte) (ValueInfo, error) {
 	if len(value) < 2 {
 		return ValueInfo{}, errors.New("value is too short")
@@ -287,114 +291,35 @@ func parseValue(value []byte) (ValueInfo, error) {
 	value = value[2:]
 
 	switch version {
-	case 0, 1:
-		return parseValueV0V1(value, int64(version))
-	case 2, 3:
-		return parseValueV2V3(value, int64(version))
+	case 3:
+		return parseValueV3(value, int64(version))
 	default:
 		return ValueInfo{}, fmt.Errorf("unsupported version: %d", version)
 	}
 }
 
-func parseValueV0V1(value []byte, version int64) (ValueInfo, error) {
-	if len(value) < 8 {
-		return ValueInfo{}, errors.New("value is too short for offset")
-	}
-	offset := int64(binary.BigEndian.Uint64(value[:8]))
-	value = value[8:]
-
-	if len(value) < 8 {
-		return ValueInfo{}, errors.New("value is too short for timestamp")
-	}
-	timestamp := time.Unix(0, int64(binary.BigEndian.Uint64(value)))
-
-	return ValueInfo{
-		Version:   version,
-		Offset:    offset,
-		Timestamp: timestamp,
-	}, nil
-}
-
-func parseValueV2V3(value []byte, version int64) (ValueInfo, error) {
-	if len(value) < 8 {
-		return ValueInfo{}, errors.New("value is too short for offset")
-	} else {
-		// print the length of the value, and print the hex value of the value
-		fmt.Printf("value length: %d, value: %x\n", len(value), value)
-	}
-	offset := int64(binary.BigEndian.Uint64(value[:8]))
-	// also skip over the metadata, which seems to always be 2 bytes of garbage
-	//value = value[10:]
-
-	// get the last 8 bytes in value:
-	value = value[len(value)-8:]
-
-	fmt.Printf("trimmed value length: %d, value: %x\n", len(value), value)
-
-	// we don't care about metadata, but need to skip over the bytes in the metadata
-	//_, remainingValue, err := decodeString(value)
-	//if err != nil {
-	//	return ValueInfo{}, fmt.Errorf("error decoding metadata: %w", err)
-	//}
-	//value = remainingValue
-
-	if len(value) < 8 {
-		return ValueInfo{}, errors.New("value is too short for commit timestamp")
-	}
-	commitTimestamp := time.Unix(0, int64(binary.BigEndian.Uint64(value[:8]))*int64(time.Millisecond))
-	value = value[8:]
-
-	if len(value) < 8 {
-		return ValueInfo{}, errors.New("value is too short for expire timestamp")
+func parseValueV3(value []byte, version int64) (ValueInfo, error) {
+	valueLength := len(value)
+	if valueLength < 16 {
+		return ValueInfo{}, errors.New("value is too short for offset and commit timestamp")
 	}
 
-	return ValueInfo{
+	offsetBytes := value[:8]
+	//metadataBytes := value[8:(valueLength - 8)]
+	commitTimestampBytes := value[(valueLength - 8):]
+
+	offset := int64(binary.BigEndian.Uint64(offsetBytes))
+	epochTime := int64(binary.BigEndian.Uint64(commitTimestampBytes))
+	commitTimestamp := time.Unix(0, epochTime*int64(time.Millisecond))
+
+	valueInfo := ValueInfo{
 		Version:   version,
 		Offset:    offset,
 		Timestamp: commitTimestamp,
-	}, nil
-}
-
-func (m *kafkaLagMonitor) displayStats(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			m.updateAndPrintStats()
-		case <-ctx.Done():
-			return
-		}
 	}
-}
 
-func (m *kafkaLagMonitor) updateAndPrintStats() {
-	m.mapMutex.Lock()
-	defer m.mapMutex.Unlock()
-
-	for _, info := range m.partitionInfoMap {
-		info.mutex.Lock()
-		currentOffset, err := m.client.GetOffset(info.topic, info.partition, sarama.OffsetNewest)
-		if err != nil {
-			log.Printf("Error getting current offset: %v", err)
-			info.mutex.Unlock()
-			continue
-		}
-		info.currentOffset = currentOffset
-		info.lag = currentOffset - info.committedOffset
-
-		timeDiff := info.lastTimestamp.Sub(info.firstTimestamp).Seconds()
-		totalRate := float64(info.lastOffset-info.firstOffset) / timeDiff
-		instantRate := 0.0
-		if info.lastTimestamp != info.firstTimestamp {
-			instantRate = float64(info.lastOffset-info.firstOffset) / info.lastTimestamp.Sub(info.firstTimestamp).Seconds()
-		}
-
-		fmt.Printf("\rTopic: %s, Partition: %d, Current: %d, Committed: %d, Lag: %d, Instant Rate: %.2f/s, Total Rate: %.2f/s",
-			info.topic, info.partition, info.currentOffset, info.committedOffset, info.lag, instantRate, totalRate)
-		info.mutex.Unlock()
-	}
+	//fmt.Printf("value length: %d, value: %x %x %x %s\n", len(value), offsetBytes, metadataBytes, commitTimestampBytes, valueInfo)
+	return valueInfo, nil
 }
 
 func waitForInterrupt(cancel context.CancelFunc) {
