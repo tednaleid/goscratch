@@ -121,6 +121,7 @@ func (m *kafkaLagMonitor) emitGroupIdProgress() {
 		partitionInfo := partitionData[key]
 
 		recordsSinceLastCommit := kv.Value.Offset - partitionInfo.lastOffset
+		formattedRecordsSinceLastCommit := fmt.Sprintf("+%d", recordsSinceLastCommit)
 		elapsedSinceLastCommit := kv.Value.Timestamp.Sub(partitionInfo.lastTimestamp).Truncate(time.Second)
 
 		var recordsPerSecondSinceLastCommit float64
@@ -130,7 +131,7 @@ func (m *kafkaLagMonitor) emitGroupIdProgress() {
 			recordsPerSecondSinceLastCommit = 0
 		}
 
-		fmt.Printf("%s %3d %s %d +%d %s %.2f/s\n", kv.Key.Topic, kv.Key.Partition, kv.Value.Timestamp, kv.Value.Offset, recordsSinceLastCommit, elapsedSinceLastCommit, recordsPerSecondSinceLastCommit)
+		fmt.Printf("%s %3d %40s %d %15s %12s %8.2f/s\n", kv.Key.Topic, kv.Key.Partition, kv.Value.Timestamp, kv.Value.Offset, formattedRecordsSinceLastCommit, elapsedSinceLastCommit, recordsPerSecondSinceLastCommit)
 
 		partitionData[key].lastOffset = kv.Value.Offset
 		partitionData[key].lastTimestamp = kv.Value.Timestamp
