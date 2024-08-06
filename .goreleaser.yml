@@ -1,0 +1,49 @@
+version: 2
+project_name: goscratch
+
+builds:
+  - id: "klag"
+    main: ./cmd/klag
+    binary: klag
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+#  - id: "jsondu"
+#    main: ./cmd/jsondu
+#    binary: jsondu
+#    goos:
+#      - linux
+#      - darwin
+#      - windows
+#    goarch:
+#      - amd64
+#      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Binary }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+release:
+  github:
+    owner: tednaleid
+    name: goscratch
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
