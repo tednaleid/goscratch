@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -13,25 +14,25 @@ import (
 )
 
 type DataSource interface {
-	CreateTableSQL(tableName, filepath string) string
+	CreateTableSQL(tableName, source string) string
 }
 
 type CSVDataSource struct{}
 
-func (c *CSVDataSource) CreateTableSQL(tableName, filepath string) string {
-	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_csv_auto('%s')", tableName, filepath)
+func (c *CSVDataSource) CreateTableSQL(tableName, source string) string {
+	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_csv_auto('%s')", tableName, source)
 }
 
 type ParquetDataSource struct{}
 
-func (p *ParquetDataSource) CreateTableSQL(tableName, filepath string) string {
-	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_parquet('%s')", tableName, filepath)
+func (p *ParquetDataSource) CreateTableSQL(tableName, source string) string {
+	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_parquet('%s')", tableName, source)
 }
 
 type IcebergDataSource struct{}
 
-func (i *IcebergDataSource) CreateTableSQL(tableName, filepath string) string {
-	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_iceberg('%s')", tableName, filepath)
+func (i *IcebergDataSource) CreateTableSQL(tableName, source string) string {
+	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_iceberg('%s')", tableName, source)
 }
 
 type QuackServer struct {
@@ -41,8 +42,8 @@ type QuackServer struct {
 	tableName    string
 }
 
-func getDataSource(path string) (DataSource, error) {
-	ext := strings.ToLower(filepath.Ext(path))
+func getDataSource(source string) (DataSource, error) {
+	ext := strings.ToLower(filepath.Ext(source))
 	switch ext {
 	case ".csv":
 		return &CSVDataSource{}, nil
@@ -51,24 +52,28 @@ func getDataSource(path string) (DataSource, error) {
 	case ".iceberg":
 		return &IcebergDataSource{}, nil
 	default:
-		return nil, fmt.Errorf("unsupported file format: %s", ext)
+		_, err := url.Parse(source)
+		if err != nil {
+			return nil, fmt.Errorf("unsupported file format: %s", ext)
+		}
+		return &CSVDataSource{}, nil
 	}
 }
 
-func NewQuackServer(filepath string) (*QuackServer, error) {
+func NewQuackServer(source string) (*QuackServer, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("opening DuckDB: %w", err)
 	}
 
-	dataSource, err := getDataSource(filepath)
+	dataSource, err := getDataSource(source)
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 
 	tableName := "data"
-	if err := createTable(db, tableName, filepath, dataSource); err != nil {
+	if err := createTable(db, tableName, source, dataSource); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -96,8 +101,8 @@ func (s *QuackServer) Close() error {
 	return s.db.Close()
 }
 
-func createTable(db *sql.DB, tableName, filepath string, ds DataSource) error {
-	sql := ds.CreateTableSQL(tableName, filepath)
+func createTable(db *sql.DB, tableName, source string, ds DataSource) error {
+	sql := ds.CreateTableSQL(tableName, source)
 	_, err := db.Exec(sql)
 	if err != nil {
 		return fmt.Errorf("creating table from file: %w", err)
@@ -119,9 +124,46 @@ func getValidColumns(db *sql.DB, tableName string) ([]string, error) {
 	return cols, nil
 }
 
+func (s *QuackServer) handleColumns(c echo.Context) error {
+	// Get first row for example values
+	rows, err := s.db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 1", s.tableName))
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "No data available"})
+	}
+
+	// Scan the row values
+	values := make([]interface{}, len(s.columnNames))
+	valuePtrs := make([]interface{}, len(s.columnNames))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if err := rows.Scan(valuePtrs...); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+
+	columnPaths := make(map[string]map[string]string)
+	for i, col := range s.columnNames {
+		val := valuePtrs[i].(*interface{})
+		
+		columnPaths[col] = map[string]string{
+			"path": fmt.Sprintf("/api/v1/query/%s/%v", col, *val),
+			"example_value": fmt.Sprintf("%v", *val),
+		}
+	}
+	
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"columns": columnPaths,
+	})
+}
+
 func (s *QuackServer) handleQuery(c echo.Context) error {
-	column := camelToSnake(c.Param("column"))
-	value := c.Param("value")
+	column := c.Param("column")
 
 	if !s.validColumns[column] {
 		return c.JSON(http.StatusBadRequest, map[string]string{
@@ -129,6 +171,7 @@ func (s *QuackServer) handleQuery(c echo.Context) error {
 		})
 	}
 
+	value := c.Param("value")
 	results, err := s.queryData(column, value)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -139,6 +182,47 @@ func (s *QuackServer) handleQuery(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, results)
+}
+
+func (s *QuackServer) handleColumnValues(c echo.Context) error {
+	column := c.Param("column")
+
+	if !s.validColumns[column] {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("Invalid column name. Valid columns are: %s", strings.Join(s.columnNames, ", ")),
+		})
+	}
+
+	query := fmt.Sprintf(`
+		SELECT %[1]s as value, COUNT(*) as count 
+		FROM %[2]s 
+		GROUP BY %[1]s 
+		ORDER BY count DESC, %[1]s
+	`, column, s.tableName)
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var value interface{}
+		var count int
+		if err := rows.Scan(&value, &count); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		results = append(results, map[string]interface{}{
+			"value": value,
+			"count": count,
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"column": column,
+		"values": results,
+	})
 }
 
 func (s *QuackServer) queryData(column, value string) ([]map[string]interface{}, error) {
@@ -180,32 +264,20 @@ func scanRow(rows *sql.Rows, cols []string) (map[string]interface{}, error) {
 	return result, nil
 }
 
-// camelToSnake converts a camelCase string to snake_case
-func camelToSnake(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if i > 0 && 'A' <= r && r <= 'Z' {
-			result.WriteRune('_')
-		}
-		result.WriteRune(r)
-	}
-	return strings.ToLower(result.String())
-}
-
 func main() {
 	var (
-		filepath = flag.String("f", "", "File to load")
-		port     = flag.Int("p", 9090, "Port to run HTTP server on")
+		source = flag.String("s", "", "Source to load (file path or URL)")
+		port   = flag.Int("p", 9090, "Port to run HTTP server on")
 	)
 	flag.Parse()
 
-	if *filepath == "" {
-		fmt.Println("Error: File is required")
+	if *source == "" {
+		fmt.Println("Error: Source is required (use -s to specify a file path or URL)")
 		flag.Usage()
 		return
 	}
 
-	server, err := NewQuackServer(*filepath)
+	server, err := NewQuackServer(*source)
 	if err != nil {
 		fmt.Printf("Error initializing server: %v\n", err)
 		return
@@ -213,6 +285,12 @@ func main() {
 	defer server.Close()
 
 	e := echo.New()
-	e.GET("/:column/:value", server.handleQuery)
+	
+	// API v1 group
+	v1 := e.Group("/api/v1")
+	v1.GET("/columns", server.handleColumns)
+	v1.GET("/query/:column", server.handleColumnValues)        // Get unique values and counts
+	v1.GET("/query/:column/:value", server.handleQuery)        // Get specific value matches
+	
 	e.Logger.Fatal(e.Start(fmt.Sprintf(":%d", *port)))
 }
