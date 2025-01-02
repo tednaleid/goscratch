@@ -152,7 +152,7 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 		val := valuePtrs[i].(*interface{})
 		
 		columnPaths[col] = map[string]string{
-			"path": fmt.Sprintf("/api/v1/query/%s/%v", col, *val),
+			"path": fmt.Sprintf("/api/v1/query/%s", col),
 			"example_value": fmt.Sprintf("%v", *val),
 		}
 	}
