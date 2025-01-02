@@ -5,30 +5,75 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 	_ "github.com/marcboeker/go-duckdb"
 )
 
+type DataSource interface {
+	CreateTableSQL(tableName, filepath string) string
+}
+
+type CSVDataSource struct{}
+
+func (c *CSVDataSource) CreateTableSQL(tableName, filepath string) string {
+	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_csv_auto('%s')", tableName, filepath)
+}
+
+type ParquetDataSource struct{}
+
+func (p *ParquetDataSource) CreateTableSQL(tableName, filepath string) string {
+	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_parquet('%s')", tableName, filepath)
+}
+
+type IcebergDataSource struct{}
+
+func (i *IcebergDataSource) CreateTableSQL(tableName, filepath string) string {
+	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_iceberg('%s')", tableName, filepath)
+}
+
 type QuackServer struct {
 	db           *sql.DB
 	validColumns map[string]bool
 	columnNames  []string
+	tableName    string
 }
 
-func NewQuackServer(csvFile string) (*QuackServer, error) {
+func getDataSource(path string) (DataSource, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".csv":
+		return &CSVDataSource{}, nil
+	case ".parquet":
+		return &ParquetDataSource{}, nil
+	case ".iceberg":
+		return &IcebergDataSource{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported file format: %s", ext)
+	}
+}
+
+func NewQuackServer(filepath string) (*QuackServer, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("opening DuckDB: %w", err)
 	}
 
-	if err := createTable(db, csvFile); err != nil {
+	dataSource, err := getDataSource(filepath)
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
 
-	columns, err := getValidColumns(db)
+	tableName := "data"
+	if err := createTable(db, tableName, filepath, dataSource); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	columns, err := getValidColumns(db, tableName)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -43,6 +88,7 @@ func NewQuackServer(csvFile string) (*QuackServer, error) {
 		db:           db,
 		validColumns: validColumns,
 		columnNames:  columns,
+		tableName:    tableName,
 	}, nil
 }
 
@@ -50,16 +96,17 @@ func (s *QuackServer) Close() error {
 	return s.db.Close()
 }
 
-func createTable(db *sql.DB, csvFile string) error {
-	_, err := db.Exec(fmt.Sprintf("CREATE TABLE data AS SELECT * FROM read_csv_auto('%s')", csvFile))
+func createTable(db *sql.DB, tableName, filepath string, ds DataSource) error {
+	sql := ds.CreateTableSQL(tableName, filepath)
+	_, err := db.Exec(sql)
 	if err != nil {
-		return fmt.Errorf("creating table from CSV: %w", err)
+		return fmt.Errorf("creating table from file: %w", err)
 	}
 	return nil
 }
 
-func getValidColumns(db *sql.DB) ([]string, error) {
-	rows, err := db.Query("SELECT * FROM data LIMIT 0")
+func getValidColumns(db *sql.DB, tableName string) ([]string, error) {
+	rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName))
 	if err != nil {
 		return nil, fmt.Errorf("getting column names: %w", err)
 	}
@@ -95,20 +142,15 @@ func (s *QuackServer) handleQuery(c echo.Context) error {
 }
 
 func (s *QuackServer) queryData(column, value string) ([]map[string]interface{}, error) {
-	rows, err := s.db.Query(fmt.Sprintf("SELECT * FROM data WHERE %s = ?", column), value)
+	rows, err := s.db.Query(fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", s.tableName, column), value)
 	if err != nil {
 		return nil, fmt.Errorf("querying data: %w", err)
 	}
 	defer rows.Close()
 
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("getting result columns: %w", err)
-	}
-
 	var results []map[string]interface{}
 	for rows.Next() {
-		result, err := scanRow(rows, cols)
+		result, err := scanRow(rows, s.columnNames)
 		if err != nil {
 			return nil, err
 		}
@@ -152,18 +194,18 @@ func camelToSnake(s string) string {
 
 func main() {
 	var (
-		csvFile = flag.String("f", "", "CSV file to load")
-		port    = flag.Int("p", 9090, "Port to run HTTP server on")
+		filepath = flag.String("f", "", "File to load")
+		port     = flag.Int("p", 9090, "Port to run HTTP server on")
 	)
 	flag.Parse()
 
-	if *csvFile == "" {
-		fmt.Println("Error: CSV file is required")
+	if *filepath == "" {
+		fmt.Println("Error: File is required")
 		flag.Usage()
 		return
 	}
 
-	server, err := NewQuackServer(*csvFile)
+	server, err := NewQuackServer(*filepath)
 	if err != nil {
 		fmt.Printf("Error initializing server: %v\n", err)
 		return
