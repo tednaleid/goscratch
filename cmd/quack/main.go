@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -150,13 +151,13 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 	columnPaths := make(map[string]map[string]string)
 	for i, col := range s.columnNames {
 		val := valuePtrs[i].(*interface{})
-		
+
 		columnPaths[col] = map[string]string{
-			"path": fmt.Sprintf("/api/v1/query/%s", col),
+			"path":          fmt.Sprintf("/api/v1/query/%s", col),
 			"example_value": fmt.Sprintf("%v", *val),
 		}
 	}
-	
+
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"columns": columnPaths,
 	})
@@ -164,21 +165,38 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 
 func (s *QuackServer) handleQuery(c echo.Context) error {
 	column := c.Param("column")
-
 	if !s.validColumns[column] {
 		return c.JSON(http.StatusBadRequest, map[string]string{
 			"error": fmt.Sprintf("Invalid column name. Valid columns are: %s", strings.Join(s.columnNames, ", ")),
 		})
 	}
 
+	// Parse pagination parameters
+	limit := 10 // default limit
+	if limitStr := c.QueryParam("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	offset := 0 // default offset
+	if offsetStr := c.QueryParam("offset"); offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
 	value := c.Param("value")
-	results, err := s.queryData(column, value)
+	results, err := s.queryData(column, value, offset, limit)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 
 	if len(results) == 0 {
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "No matching records found"})
+		if offset == 0 {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "No matching records found"})
+		}
+		return c.NoContent(http.StatusNoContent) // No more results at this offset
 	}
 
 	return c.JSON(http.StatusOK, results)
@@ -225,8 +243,13 @@ func (s *QuackServer) handleColumnValues(c echo.Context) error {
 	})
 }
 
-func (s *QuackServer) queryData(column, value string) ([]map[string]interface{}, error) {
-	rows, err := s.db.Query(fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", s.tableName, column), value)
+func (s *QuackServer) queryData(column, value string, offset, limit int) ([]map[string]interface{}, error) {
+	// Note: No explicit ORDER BY clause. Initial testing shows DuckDB maintains a stable
+	// sort order for static files, but this is not guaranteed by the documentation.
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ? LIMIT ? OFFSET ?", 
+		s.tableName, column)
+	
+	rows, err := s.db.Query(query, value, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("querying data: %w", err)
 	}
@@ -236,7 +259,7 @@ func (s *QuackServer) queryData(column, value string) ([]map[string]interface{},
 	for rows.Next() {
 		result, err := scanRow(rows, s.columnNames)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scanning row: %w", err)
 		}
 		results = append(results, result)
 	}
@@ -285,12 +308,12 @@ func main() {
 	defer server.Close()
 
 	e := echo.New()
-	
+
 	// API v1 group
 	v1 := e.Group("/api/v1")
 	v1.GET("/columns", server.handleColumns)
-	v1.GET("/query/:column", server.handleColumnValues)        // Get unique values and counts
-	v1.GET("/query/:column/:value", server.handleQuery)        // Get specific value matches
-	
+	v1.GET("/query/:column", server.handleColumnValues) // Get unique values and counts
+	v1.GET("/query/:column/:value", server.handleQuery) // Get specific value matches
+
 	e.Logger.Fatal(e.Start(fmt.Sprintf(":%d", *port)))
 }
