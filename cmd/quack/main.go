@@ -43,6 +43,21 @@ type QuackServer struct {
 	tableName    string
 }
 
+type ColumnSummary struct {
+	Name           string      `json:"name"`
+	Type           string      `json:"type"`
+	Min            interface{} `json:"min,omitempty"`
+	Max            interface{} `json:"max,omitempty"`
+	ApproxUnique   int         `json:"approx_unique,omitempty"`
+	Avg            interface{} `json:"avg,omitempty"`
+	Std            interface{} `json:"std,omitempty"`
+	Q25            interface{} `json:"q25,omitempty"`
+	Q50            interface{} `json:"q50,omitempty"`
+	Q75            interface{} `json:"q75,omitempty"`
+	Count          int         `json:"count"`
+	NullPercentage float64     `json:"null_percentage"`
+}
+
 func getDataSource(source string) (DataSource, error) {
 	ext := strings.ToLower(filepath.Ext(source))
 	switch ext {
@@ -126,41 +141,78 @@ func getValidColumns(db *sql.DB, tableName string) ([]string, error) {
 }
 
 func (s *QuackServer) handleColumns(c echo.Context) error {
-	// Get first row for example values
-	rows, err := s.db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 1", s.tableName))
+	query := fmt.Sprintf("SUMMARIZE SELECT * FROM %s", s.tableName)
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	defer rows.Close()
 
-	if !rows.Next() {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "No data available"})
-	}
-
-	// Scan the row values
-	values := make([]interface{}, len(s.columnNames))
-	valuePtrs := make([]interface{}, len(s.columnNames))
-	for i := range values {
-		valuePtrs[i] = &values[i]
-	}
-
-	if err := rows.Scan(valuePtrs...); err != nil {
+	cols, err := rows.Columns()
+	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 
-	columnPaths := make(map[string]map[string]string)
-	for i, col := range s.columnNames {
-		val := valuePtrs[i].(*interface{})
-
-		columnPaths[col] = map[string]string{
-			"path":          fmt.Sprintf("/api/v1/query/%s", col),
-			"example_value": fmt.Sprintf("%v", *val),
+	var summaries []ColumnSummary
+	for rows.Next() {
+		// Create a slice of interface{} to hold the values
+		values := make([]interface{}, len(cols))
+		for i := range values {
+			values[i] = new(interface{})
 		}
+
+		if err := rows.Scan(values...); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+
+		// Create a map of the column data
+		data := make(map[string]interface{})
+		for i, col := range cols {
+			if v := *(values[i].(*interface{})); v != nil {
+				data[col] = v
+			}
+		}
+
+		// Map the data to our struct
+		summary := ColumnSummary{
+			Name:           data["column_name"].(string),
+			Type:           data["column_type"].(string),
+			Min:            data["min"],
+			Max:            data["max"],
+			ApproxUnique:   int(data["approx_unique"].(int64)),
+			Count:          int(data["count"].(int64)),
+		}
+
+		// Handle optional numeric fields
+		if avg, ok := data["avg"]; ok && avg != nil {
+			summary.Avg = avg
+		}
+		if std, ok := data["std"]; ok && std != nil {
+			summary.Std = std
+		}
+		if q25, ok := data["q25"]; ok && q25 != nil {
+			summary.Q25 = q25
+		}
+		if q50, ok := data["q50"]; ok && q50 != nil {
+			summary.Q50 = q50
+		}
+		if q75, ok := data["q75"]; ok && q75 != nil {
+			summary.Q75 = q75
+		}
+
+		// Convert null_percentage from decimal
+		if np, ok := data["null_percentage"]; ok && np != nil {
+			if str := fmt.Sprintf("%v", np); str != "" {
+				if npFloat, err := strconv.ParseFloat(str, 64); err == nil {
+					summary.NullPercentage = npFloat
+				}
+			}
+		}
+
+		summaries = append(summaries, summary)
 	}
 
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"columns": columnPaths,
-	})
+	return c.JSON(http.StatusOK, summaries)
 }
 
 func (s *QuackServer) handleQuery(c echo.Context) error {
