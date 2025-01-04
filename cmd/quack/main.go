@@ -43,6 +43,15 @@ type QuackServer struct {
 	tableName    string
 }
 
+type Link struct {
+	Href string `json:"href"`
+}
+
+type Links struct {
+	Values  Link `json:"values"`   // Points to unique values endpoint
+	Records Link `json:"records"`  // Template for querying records by this column's value
+}
+
 type ColumnSummary struct {
 	Name           string      `json:"name"`
 	Type           string      `json:"type"`
@@ -56,6 +65,7 @@ type ColumnSummary struct {
 	Q75            interface{} `json:"q75,omitempty"`
 	Count          int         `json:"count"`
 	NullPercentage float64     `json:"null_percentage"`
+	Links          Links       `json:"_links"`
 }
 
 func getDataSource(source string) (DataSource, error) {
@@ -155,7 +165,6 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 
 	var summaries []ColumnSummary
 	for rows.Next() {
-		// Create a slice of interface{} to hold the values
 		values := make([]interface{}, len(cols))
 		for i := range values {
 			values[i] = new(interface{})
@@ -165,7 +174,6 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 
-		// Create a map of the column data
 		data := make(map[string]interface{})
 		for i, col := range cols {
 			if v := *(values[i].(*interface{})); v != nil {
@@ -173,14 +181,22 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 			}
 		}
 
-		// Map the data to our struct
+		colName := data["column_name"].(string)
 		summary := ColumnSummary{
-			Name:           data["column_name"].(string),
+			Name:           colName,
 			Type:           data["column_type"].(string),
 			Min:            data["min"],
 			Max:            data["max"],
 			ApproxUnique:   int(data["approx_unique"].(int64)),
 			Count:          int(data["count"].(int64)),
+			Links: Links{
+				Values: Link{
+					Href: fmt.Sprintf("/api/v1/columns/%s", colName),
+				},
+				Records: Link{
+					Href: fmt.Sprintf("/api/v1/records?column=%s&value={value}", colName),
+				},
+			},
 		}
 
 		// Handle optional numeric fields
@@ -216,10 +232,23 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 }
 
 func (s *QuackServer) handleQuery(c echo.Context) error {
-	column := c.Param("column")
+	column := c.QueryParam("column")
+	if column == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": "column query parameter is required",
+		})
+	}
+
 	if !s.validColumns[column] {
 		return c.JSON(http.StatusBadRequest, map[string]string{
 			"error": fmt.Sprintf("Invalid column name. Valid columns are: %s", strings.Join(s.columnNames, ", ")),
+		})
+	}
+
+	value := c.QueryParam("value")
+	if value == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": "value query parameter is required",
 		})
 	}
 
@@ -238,7 +267,6 @@ func (s *QuackServer) handleQuery(c echo.Context) error {
 		}
 	}
 
-	value := c.Param("value")
 	results, err := s.queryData(column, value, offset, limit)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -279,7 +307,7 @@ func (s *QuackServer) handleColumnValues(c echo.Context) error {
 	var results []map[string]interface{}
 	for rows.Next() {
 		var value interface{}
-		var count int
+		var count int64
 		if err := rows.Scan(&value, &count); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -289,10 +317,7 @@ func (s *QuackServer) handleColumnValues(c echo.Context) error {
 		})
 	}
 
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"column": column,
-		"values": results,
-	})
+	return c.JSON(http.StatusOK, results)
 }
 
 func (s *QuackServer) queryData(column, value string, offset, limit int) ([]map[string]interface{}, error) {
@@ -363,9 +388,9 @@ func main() {
 
 	// API v1 group
 	v1 := e.Group("/api/v1")
-	v1.GET("/columns", server.handleColumns)
-	v1.GET("/query/:column", server.handleColumnValues) // Get unique values and counts
-	v1.GET("/query/:column/:value", server.handleQuery) // Get specific value matches
+	v1.GET("/columns", server.handleColumns)                // List all columns with metadata
+	v1.GET("/columns/:column", server.handleColumnValues)   // Get unique values for a column
+	v1.GET("/records", server.handleQuery)                 // Query records with column/value as query params
 
 	e.Logger.Fatal(e.Start(fmt.Sprintf(":%d", *port)))
 }
