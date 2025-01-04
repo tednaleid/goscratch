@@ -2,15 +2,17 @@ package main
 
 import (
 	"database/sql"
-	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/labstack/echo/v4"
+	"github.com/urfave/cli/v2"
 	_ "github.com/marcboeker/go-duckdb"
 )
 
@@ -36,6 +38,8 @@ func (i *IcebergDataSource) CreateTableSQL(tableName, source string) string {
 	return fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM read_iceberg('%s')", tableName, source)
 }
 
+const defaultPageSize = 10
+
 type QuackServer struct {
 	db           *sql.DB
 	validColumns map[string]bool
@@ -48,8 +52,9 @@ type Link struct {
 }
 
 type Links struct {
-	Values  Link `json:"values"`   // Points to unique values endpoint
-	Records Link `json:"records"`  // Template for querying records by this column's value
+	Values       Link `json:"values"`      // Points to unique values endpoint
+	Records      Link `json:"records"`     // Template for querying records by query params
+	RecordsAlias Link `json:"recordsAlias"` // Template for querying records by path
 }
 
 type ColumnSummary struct {
@@ -196,6 +201,9 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 				Records: Link{
 					Href: fmt.Sprintf("/api/v1/records?column=%s&value={value}", colName),
 				},
+				RecordsAlias: Link{
+					Href: fmt.Sprintf("/api/v1/columns/%s/{value}", colName),
+				},
 			},
 		}
 
@@ -233,9 +241,13 @@ func (s *QuackServer) handleColumns(c echo.Context) error {
 
 func (s *QuackServer) handleQuery(c echo.Context) error {
 	column := c.QueryParam("column")
-	if column == "" {
+	value := c.QueryParam("value")
+	offset := 0
+	limit := defaultPageSize
+
+	if column == "" || value == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{
-			"error": "column query parameter is required",
+			"error": "Both column and value parameters are required",
 		})
 	}
 
@@ -245,38 +257,39 @@ func (s *QuackServer) handleQuery(c echo.Context) error {
 		})
 	}
 
-	value := c.QueryParam("value")
-	if value == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"error": "value query parameter is required",
-		})
-	}
-
-	// Parse pagination parameters
-	limit := 10 // default limit
-	if limitStr := c.QueryParam("limit"); limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			limit = l
+	if offsetStr := c.QueryParam("offset"); offsetStr != "" {
+		var err error
+		offset, err = strconv.Atoi(offsetStr)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": "Invalid offset parameter",
+			})
+		}
+		if offset < 0 {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": "Offset must be non-negative",
+			})
 		}
 	}
 
-	offset := 0 // default offset
-	if offsetStr := c.QueryParam("offset"); offsetStr != "" {
-		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
-			offset = o
+	if limitStr := c.QueryParam("limit"); limitStr != "" {
+		var err error
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": "Invalid limit parameter",
+			})
+		}
+		if limit < 1 {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": "Limit must be at least 1",
+			})
 		}
 	}
 
 	results, err := s.queryData(column, value, offset, limit)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-	}
-
-	if len(results) == 0 {
-		if offset == 0 {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "No matching records found"})
-		}
-		return c.NoContent(http.StatusNoContent) // No more results at this offset
 	}
 
 	return c.JSON(http.StatusOK, results)
@@ -318,6 +331,20 @@ func (s *QuackServer) handleColumnValues(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, results)
+}
+
+func (s *QuackServer) handleColumnValueRedirect(c echo.Context) error {
+	column := c.Param("column")
+	value := c.Param("value")
+
+	if !s.validColumns[column] {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("Invalid column name. Valid columns are: %s", strings.Join(s.columnNames, ", ")),
+		})
+	}
+
+	return c.Redirect(http.StatusFound, fmt.Sprintf("/api/v1/records?column=%s&value=%s&limit=%d&offset=0", 
+		column, value, defaultPageSize))
 }
 
 func (s *QuackServer) queryData(column, value string, offset, limit int) ([]map[string]interface{}, error) {
@@ -365,32 +392,52 @@ func scanRow(rows *sql.Rows, cols []string) (map[string]interface{}, error) {
 }
 
 func main() {
-	var (
-		source = flag.String("s", "", "Source to load (file path or URL)")
-		port   = flag.Int("p", 9090, "Port to run HTTP server on")
-	)
-	flag.Parse()
+	app := &cli.App{
+		Name:    "quack",
+		Usage:   "A DuckDB-powered REST API server for querying data files",
+		Version: "0.1.0",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "source",
+				Aliases:  []string{"s"},
+				Usage:    "Source file to load (CSV, Parquet, or Iceberg)",
+				Required: true,
+				EnvVars:  []string{"QUACK_SOURCE"},
+			},
+			&cli.IntFlag{
+				Name:    "port",
+				Aliases: []string{"p"},
+				Usage:   "Port to run HTTP server on",
+				Value:   9090,
+				EnvVars: []string{"QUACK_PORT"},
+			},
+			&cli.IntFlag{
+				Name:    "page-size",
+				Aliases: []string{"n"},
+				Usage:   "Default number of records per page",
+				Value:   defaultPageSize,
+				EnvVars: []string{"QUACK_PAGE_SIZE"},
+			},
+		},
+		Action: func(c *cli.Context) error {
+			server, err := NewQuackServer(c.String("source"))
+			if err != nil {
+				return fmt.Errorf("error initializing server: %w", err)
+			}
+			defer server.Close()
 
-	if *source == "" {
-		fmt.Println("Error: Source is required (use -s to specify a file path or URL)")
-		flag.Usage()
-		return
+			e := echo.New()
+			v1 := e.Group("/api/v1")
+			v1.GET("/columns", server.handleColumns)
+			v1.GET("/columns/:column", server.handleColumnValues)
+			v1.GET("/columns/:column/:value", server.handleColumnValueRedirect)
+			v1.GET("/records", server.handleQuery)
+
+			return e.Start(fmt.Sprintf(":%d", c.Int("port")))
+		},
 	}
 
-	server, err := NewQuackServer(*source)
-	if err != nil {
-		fmt.Printf("Error initializing server: %v\n", err)
-		return
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
 	}
-	defer server.Close()
-
-	e := echo.New()
-
-	// API v1 group
-	v1 := e.Group("/api/v1")
-	v1.GET("/columns", server.handleColumns)                // List all columns with metadata
-	v1.GET("/columns/:column", server.handleColumnValues)   // Get unique values for a column
-	v1.GET("/records", server.handleQuery)                 // Query records with column/value as query params
-
-	e.Logger.Fatal(e.Start(fmt.Sprintf(":%d", *port)))
 }
